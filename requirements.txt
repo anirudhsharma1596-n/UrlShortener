@@ -1,0 +1,12 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0     # The server that runs FastAPI (like gunicorn for Flask)
+sqlalchemy==2.0.30            # ORM — turns Python classes into SQL tables
+alembic==1.13.1               # Database migrations (like Flask-Migrate)
+psycopg2-binary==2.9.9        # PostgreSQL driver
+redis==5.0.4                  # Redis client
+python-dotenv==1.0.1          # Reads our .env file
+pydantic==2.7.1               # Data validation (built into FastAPI)
+pydantic-settings==2.2.1      # Settings management with pydantic
+httpx==0.27.0                 # For testing our API
+pytest==8.2.0                 # Testing
+user-agents==2.2.0            # Parse browser/OS from request headers
