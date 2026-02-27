@@ -1,0 +1,54 @@
+# docker-compose.yml
+version: '3.9'
+
+services:
+
+  # Our FastAPI application
+  app:
+    build: .                          # Build using our Dockerfile
+    ports:
+      - "8000:8000"                   # host:container port mapping
+    volumes:
+      - .:/app                        # Mount local code into container (enables --reload)
+    env_file:
+      - .env                          # Load our environment variables
+    depends_on:
+      postgres:
+        condition: service_healthy    # Don't start until postgres is ready
+      redis:
+        condition: service_healthy
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:16-alpine         # Official image, alpine = smaller size
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"                   # Expose so you can connect with a DB GUI
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # Persist data between restarts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis cache
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"                   # Expose so you can inspect with redis-cli
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+# Named volumes — Docker manages where these actually live on disk
+volumes:
+  postgres_data:
+  redis_data:
