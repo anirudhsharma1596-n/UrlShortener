@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     APP_SECRET_KEY: str
     BASE_URL: str
 
+    CACHE_TTL_SECONDS: int = 3600
+
     class Config:
         env_file = ".env"
 
