@@ -2,7 +2,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import update
 from datetime import datetime, timezone
 
 from app.database import get_db
@@ -10,42 +9,33 @@ from app import models
 from app.schemas import URLCreate, URLResponse
 from app.utils.shortcode import generate_short_code
 from app.config import settings
+from app.cache import cache_url, get_cached_url, invalidate_url_cache  # ← new
+from app.utils.user_agent import extract_browser, extract_os
+from app.utils.rate_limiter import (   # ← new
+    check_rate_limit,
+    create_url_limiter,
+    redirect_limiter
+)
+
 
 router = APIRouter()
 
 
-# ─────────────────────────────────────────
-# POST /urls  — Create a short URL
-# ─────────────────────────────────────────
-@router.post("/urls", response_model=URLResponse, status_code=201)
+@router.post("/urls", response_model=URLResponse, 
+             status_code=201
+            ,dependencies=[Depends(check_rate_limit(create_url_limiter))] )
 def create_short_url(payload: URLCreate, db: Session = Depends(get_db)):
-    """
-    Receives a long URL, returns a short one.
-    
-    FastAPI automatically:
-    - Parses the JSON body into a URLCreate object
-    - Validates all fields (HttpUrl check, length limits)
-    - Returns 422 with clear errors if validation fails
-    """
-
-    # Handle custom code if user provided one
+    # No changes here — caching on create isn't necessary
+    # The first GET will populate the cache
     if payload.custom_code:
-        # Check if this custom code is already taken
         existing = db.query(models.URL).filter(
             models.URL.short_code == payload.custom_code
         ).first()
         if existing:
-            raise HTTPException(
-                status_code=409,   # 409 Conflict
-                detail=f"Code '{payload.custom_code}' is already taken"
-            )
+            raise HTTPException(status_code=409, detail=f"Code '{payload.custom_code}' is already taken")
         short_code = payload.custom_code
-
     else:
-        # Auto-generate a unique code
-        # Keep trying until we get one that doesn't exist
-        # In practice this loop runs once — collisions are rare
-        for _ in range(5):   # max 5 attempts
+        for _ in range(5):
             short_code = generate_short_code()
             exists = db.query(models.URL).filter(
                 models.URL.short_code == short_code
@@ -53,82 +43,92 @@ def create_short_url(payload: URLCreate, db: Session = Depends(get_db)):
             if not exists:
                 break
         else:
-            # 'else' on a for loop runs if we never hit 'break'
-            raise HTTPException(
-                status_code=500,
-                detail="Could not generate unique code, try again"
-            )
+            raise HTTPException(status_code=500, detail="Could not generate unique code, try again")
 
-    # Create the database record
     url = models.URL(
         short_code=short_code,
-        original_url=str(payload.original_url),  # convert HttpUrl to plain string
+        original_url=str(payload.original_url),
         expires_at=payload.expires_at,
     )
     db.add(url)
     db.commit()
-    db.refresh(url)   # reload from DB so we get the generated id, created_at etc.
+    db.refresh(url)
 
-    # Construct the full short URL to return
-    # We add this field that doesn't exist in the DB
     url.short_url = f"{settings.BASE_URL}/{url.short_code}"
-
     return url
 
 
-# ─────────────────────────────────────────
-# GET /{short_code}  — Redirect to original URL
-# ─────────────────────────────────────────
-@router.get("/{short_code}")
+@router.get("/{short_code}",dependencies=[Depends(check_rate_limit(redirect_limiter))])
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
-    """
-    The core feature — someone visits /aB3xZ9 and gets sent to the original URL.
-    We also record the click for analytics.
-    """
 
-    # Look up the short code
-    url = db.query(models.URL).filter(
-        models.URL.short_code == short_code,
-        models.URL.is_active == True
-    ).first()
+    original_url = None   # what we'll ultimately redirect to
 
-    if not url:
-        raise HTTPException(status_code=404, detail="Short URL not found")
+    # ── Step 1: Check Redis first ──────────────────────────────
+    cached = get_cached_url(short_code)
 
-    # Check if the URL has expired
-    if url.expires_at and url.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=410, detail="This short URL has expired")
-        # 410 Gone — more accurate than 404, means "existed but no longer available"
+    if cached:
+        # Cache hit — we have everything we need, skip the DB
+        # Still need to check expiry even from cache
+        if cached.get("expires_at"):
+            expires_at = datetime.fromisoformat(cached["expires_at"])
+            if expires_at < datetime.now(timezone.utc):
+                raise HTTPException(status_code=410, detail="This short URL has expired")
 
-    # Record the click (we'll expand this with more data in Phase 5)
+        original_url = cached["original_url"]
+        url_id = cached["id"]
+
+    else:
+        # ── Step 2: Cache miss — go to PostgreSQL ──────────────
+        url = db.query(models.URL).filter(
+            models.URL.short_code == short_code,
+            models.URL.is_active == True
+        ).first()
+
+        if not url:
+            raise HTTPException(status_code=404, detail="Short URL not found")
+
+        if url.expires_at and url.expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="This short URL has expired")
+
+        # ── Step 3: Populate the cache for next time ───────────
+        cache_url(
+            short_code=short_code,
+            url_data={
+                "id": url.id,
+                "original_url": url.original_url,
+                "expires_at": url.expires_at.isoformat() if url.expires_at else None,
+            },
+            ttl_seconds=settings.CACHE_TTL_SECONDS
+        )
+
+        original_url = url.original_url
+        url_id = url.id
+
+    # ── Step 4: Record the click (always hits DB — that's fine) ─
+    # Analytics writes are less critical than redirect reads
+    raw_user_agent = request.headers.get("user-agent")
+
     click = models.Click(
-        url_id=url.id,
+        url_id=url_id,
         ip_address=request.client.host,
-        user_agent=request.headers.get("user-agent"),
+        user_agent=raw_user_agent,
         referer=request.headers.get("referer"),
+        browser=extract_browser(raw_user_agent),   # ← parse and store clean value
+        os=extract_os(raw_user_agent),             # ← parse and store clean value
     )
     db.add(click)
 
-    # Increment the denormalized click counter on the URL itself
-    url.click_count += 1
+    # Update denormalized count
+    db.query(models.URL).filter(models.URL.id == url_id).update(
+        {"click_count": models.URL.click_count + 1}
+    )
     db.commit()
 
-    # 307 Temporary Redirect — tells browsers "this is intentional,
-    # but don't cache it permanently" (unlike 301 which browsers cache forever)
-    return RedirectResponse(url=url.original_url, status_code=307)
+    return RedirectResponse(url=original_url, status_code=307)
 
 
-# ─────────────────────────────────────────
-# DELETE /urls/{short_code}  — Deactivate a URL
-# ─────────────────────────────────────────
 @router.delete("/urls/{short_code}", status_code=204)
 def delete_url(short_code: str, db: Session = Depends(get_db)):
-    """
-    We don't actually delete the row — we set is_active=False.
-    This preserves click history for analytics.
-    This pattern is called a 'soft delete'.
-    """
-
     url = db.query(models.URL).filter(
         models.URL.short_code == short_code
     ).first()
@@ -139,5 +139,7 @@ def delete_url(short_code: str, db: Session = Depends(get_db)):
     url.is_active = False
     db.commit()
 
-    # 204 No Content — success, but nothing to return
+    # ── Invalidate cache so Redis doesn't serve a deleted URL ──
+    invalidate_url_cache(short_code)
+
     return None
